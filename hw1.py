@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import train_test_split
 from torch.utils.data import TensorDataset, DataLoader
-from utils import getTrajectoryTrainData, getTrajectoryTestData
+from utils import getTrajectoryTrainData, getTrajectoryTestData, getVisionTrainData, getVisionTestData
 from trajectory_model import TrajectoryModel
 from vision_model import VisionModel
 from fusion_model import FusionModel
-from train import trainModel
-from test import testModel
+from train import trainTrajectoryModel, trainVisionModel
+from test import testTrajectoryModel, testVisionModel
 
 def selectMode():
     print("Select mode:")
@@ -35,19 +35,28 @@ if __name__ == "__main__":
         if mode == "1":
             print("Training trajectory-only model.")
             input_data, output_data = getTrajectoryTrainData()
-            trainModel(model, input_data, output_data, device)
+            trainTrajectoryModel(model, input_data, output_data, device)
 
         elif mode == "2":
             print("Inference trajectory-only model.")
             test_data_dict = getTrajectoryTestData()
             model.load_state_dict(torch.load("trajectory_model.pth"))
-            testModel(model, test_data_dict, device)
+            testTrajectoryModel(model, test_data_dict, device)
 
-    elif mode == "3":
-        print("Training vision-only model.")
+    elif mode in ["3", "4"]:
+        model = VisionModel()
 
-    elif mode == "4":
-        print("Inference vision-only model.")
+        if mode == "3":
+            print("Training vision-only model.")
+            input_data, output_data = getVisionTrainData()
+            trainVisionModel(model, input_data, output_data, device)
+
+        elif mode == "4":
+            print("Inference vision-only model.")
+            test_data_dict = getVisionTestData()
+            model.load_state_dict(torch.load("vision_model.pth"))
+            testVisionModel(model, test_data_dict, device)
+
 
     elif mode == "5":
         print("Training fusion model.")
