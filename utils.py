@@ -165,8 +165,114 @@ class VisionDataset(Dataset):
         return frames_tensor, label_tensor
 
 
-# split data into training and validation sets
-def splitTrainVal(input_data, output_data, val_ratio=0.1):
+def getFusionTrainData():
+    input_paths = []
+    input_coords = []
+    output_data = []
+    
+    for game_folder in os.listdir(dataset):
+        if game_folder.startswith("game"):
+            for clip_folder in os.listdir(os.path.join(dataset, game_folder)):
+                if clip_folder.startswith("Clip") and clip_folder != test_clip:
+                    clip_path = os.path.join(dataset, game_folder, clip_folder)
+                    img_files = sorted([f for f in os.listdir(clip_path) if f.endswith('.jpg')])
+                    
+                    label_file = os.path.join(clip_path, "Label.csv")
+                    df = pd.read_csv(label_file)
+                    df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
+                    df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df['x-coordinate'] = df['x-coordinate'].interpolate(method='linear').bfill().ffill()
+                    df['y-coordinate'] = df['y-coordinate'].interpolate(method='linear').bfill().ffill()
+
+                    for i in range(0, len(img_files) - 20, 20):
+                        # 1. Image Paths
+                        input_imgs = []
+                        for j in range(i, i+10):
+                            input_imgs.append(os.path.join(clip_path, img_files[j]))
+                        
+                        input_paths.append(input_imgs)
+                        input_coords.append(df.iloc[i:i+10][['x-coordinate', 'y-coordinate']].values)  # Trajectory input
+                        output_data.append(df.iloc[i+10:i+20][['x-coordinate', 'y-coordinate']].values)  # Trajectory output
+
+    return (input_paths, np.array(input_coords, dtype=np.float32)), np.array(output_data, dtype=np.float32)
+
+def getFusionTestData():
+    test_data_dict = {}
+    
+    for game_folder in os.listdir(dataset):
+        if game_folder.startswith("game"):
+            for clip_folder in os.listdir(os.path.join(dataset, game_folder)):
+                if clip_folder.startswith("Clip") and clip_folder == test_clip:
+                    clip_path = os.path.join(dataset, game_folder, clip_folder)
+                    img_files = sorted([f for f in os.listdir(clip_path) if f.endswith('.jpg')])
+                    
+                    label_file = os.path.join(clip_path, "Label.csv")
+                    df = pd.read_csv(label_file)
+                    df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
+                    df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    
+                    input_paths = []
+                    input_coords = []
+                    output_data = []
+                    
+                    for i in range(0, len(img_files) - 20, 20):
+                        input_imgs = []
+                        for j in range(i, i+10):
+                            input_imgs.append(os.path.join(clip_path, img_files[j]))
+                            
+                        in_slice = df.iloc[i:i+10][['x-coordinate', 'y-coordinate']].copy()
+                        in_slice['x-coordinate'] = in_slice['x-coordinate'].interpolate(method='linear').bfill().ffill()
+                        in_slice['y-coordinate'] = in_slice['y-coordinate'].interpolate(method='linear').bfill().ffill()
+                        
+                        out_slice = df.iloc[i+10:i+20][['x-coordinate', 'y-coordinate']].values
+                        
+                        input_paths.append(input_imgs)
+                        input_coords.append(in_slice.values)
+                        output_data.append(out_slice)
+                    
+                    test_data_dict[game_folder] = (
+                        (input_paths, np.array(input_coords, dtype=np.float32)), 
+                        np.array(output_data, dtype=np.float32)
+                    )
+
+    return test_data_dict
+
+
+class FusionDataset(Dataset):
+    def __init__(self, input_data, target_coords, transform=None):
+        self.image_paths, self.input_coords = input_data
+        self.target_coords = target_coords
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        window_paths = self.image_paths[idx]
+        in_coords = self.input_coords[idx]
+        out_coords = self.target_coords[idx]
+
+        frames = []
+        for path in window_paths:
+            img = Image.open(path).convert('RGB')
+            if self.transform:
+                img = self.transform(img)
+            frames.append(img)
+
+        frames_tensor = torch.stack(frames)
+        in_coords_tensor = torch.tensor(in_coords, dtype=torch.float32)
+        out_coords_tensor = torch.tensor(out_coords, dtype=torch.float32)
+
+        # Return a tuple of ((images, input_trajectory), target_trajectory)
+        return (frames_tensor, in_coords_tensor), out_coords_tensor
+
+
+# split data into training and validation sets for regular input (list/array)
+def splitTrainValRegular(input_data, output_data, val_ratio=0.1):
     total_samples = len(input_data)
     val_size = int(total_samples * val_ratio)
 
@@ -176,3 +282,24 @@ def splitTrainVal(input_data, output_data, val_ratio=0.1):
     val_output = output_data[-val_size:]
 
     return train_input, train_output, val_input, val_output
+
+
+# split data into training and validation sets for fusion input tuple
+def splitTrainValFusion(input_data, output_data, val_ratio=0.1):
+    image_paths, input_coords = input_data
+    total_samples = len(image_paths)
+
+    val_size = int(total_samples * val_ratio)
+    train_input = (image_paths[:-val_size], input_coords[:-val_size])
+    val_input = (image_paths[-val_size:], input_coords[-val_size:])
+    train_output = output_data[:-val_size]
+    val_output = output_data[-val_size:]
+
+    return train_input, train_output, val_input, val_output
+
+
+# Backward-compatible wrapper
+def splitTrainVal(input_data, output_data, val_ratio=0.1):
+    if isinstance(input_data, (tuple, list)) and len(input_data) == 2:
+        return splitTrainValFusion(input_data, output_data, val_ratio)
+    return splitTrainValRegular(input_data, output_data, val_ratio)

@@ -1,17 +1,14 @@
 # a neural network model using car's current velocity and delta state to predict target velocity
-import os
+
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.model_selection import train_test_split
-from torch.utils.data import TensorDataset, DataLoader
-from utils import getTrajectoryTrainData, getTrajectoryTestData, getVisionTrainData, getVisionTestData
+from utils import (getTrajectoryTrainData, getTrajectoryTestData, 
+                   getVisionTrainData, getVisionTestData, 
+                   getFusionTrainData, getFusionTestData)
 from trajectory_model import TrajectoryModel
 from vision_model import VisionModel
 from fusion_model import FusionModel
-from train import trainTrajectoryModel, trainVisionModel
-from test import testTrajectoryModel, testVisionModel
+from train import trainTrajectoryModel, trainVisionModel, trainFusionModel
+from test import testTrajectoryModel, testVisionModel, testFusionModel
 
 def selectMode():
     print("Select mode:")
@@ -57,12 +54,19 @@ if __name__ == "__main__":
             model.load_state_dict(torch.load("vision_model.pth"))
             testVisionModel(model, test_data_dict, device)
 
+    elif mode in ["5", "6"]:
+        model = FusionModel()
 
-    elif mode == "5":
-        print("Training fusion model.")
+        if mode == "5":
+            print("Training fusion model.")
+            input_data, output_data = getFusionTrainData()
+            trainFusionModel(model, input_data, output_data, device)
 
-    elif mode == "6":
-        print("Inference fusion model.")
+        elif mode == "6":
+            print("Inference fusion model.")
+            test_data_dict = getFusionTestData()
+            model.load_state_dict(torch.load("fusion_model.pth"))
+            testFusionModel(model, test_data_dict, device)
 
     else:
         print("Invalid mode selected. Please enter a number between 1 and 6.")

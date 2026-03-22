@@ -3,7 +3,7 @@ import time
 from utils import splitTrainVal
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
-from utils import VisionDataset
+from utils import VisionDataset, FusionDataset
 
 def trainTrajectoryModel(model, input_data, output_data, device, num_epochs=300, batch_size=64, learning_rate=0.001):
     model.to(device)
@@ -107,3 +107,59 @@ def trainVisionModel(model, input_data, output_data, device, num_epochs=100, bat
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), "vision_model.pth")
+
+
+def trainFusionModel(model, input_data, output_data, device, num_epochs=30, batch_size=8, learning_rate=0.001):
+    model.to(device)
+    criterion = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    writer = SummaryWriter(log_dir=f"logs/{timestamp}")
+
+    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data)
+    
+    train_dataset = FusionDataset(train_input, train_output)
+    val_dataset = FusionDataset(val_input, val_output)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+    best_val_loss = float('inf')
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        
+        for (batch_images, batch_traj), batch_output in train_loader:
+            batch_images = batch_images.to(device)
+            batch_traj = batch_traj.to(device)
+            batch_output = batch_output.to(device)
+            optimizer.zero_grad()
+            predictions = model(batch_images, batch_traj)
+            loss = criterion(predictions, batch_output)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for (val_images_batch, val_traj_batch), val_output_batch in val_loader:
+                val_images_batch = val_images_batch.to(device)
+                val_traj_batch = val_traj_batch.to(device)
+                val_output_batch = val_output_batch.to(device)
+                val_predictions = model(val_images_batch, val_traj_batch)
+                val_loss += criterion(val_predictions, val_output_batch).item()
+
+        avg_val_loss = val_loss / len(val_loader)
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        writer.add_scalar("Loss/train", avg_loss, epoch)
+        writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "fusion_model.pth")
