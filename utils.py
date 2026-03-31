@@ -1,19 +1,118 @@
 import os
-import pandas as pd
+import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
 from PIL import Image
 from torch.utils.data import Dataset
 import torchvision.transforms as transforms
-import torch
 
 dataset = "TrackNet/Dataset/"
 test_clip = "Clip1"  # Clip1 for testing
+VIDEO_WIDTH = 1280.0
+VIDEO_HEIGHT = 720.0
+RESIZED_HEIGHT = 288
+RESIZED_WIDTH = 512
+DEFAULT_IMAGE_SIZE = (RESIZED_HEIGHT, RESIZED_WIDTH)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def _resolve_image_size(image_size):
+    if isinstance(image_size, int):
+        return (image_size, image_size)
+    if isinstance(image_size, (tuple, list)) and len(image_size) == 2:
+        return (int(image_size[0]), int(image_size[1]))
+    raise ValueError("image_size must be an int or a tuple/list of (height, width).")
+
+
+def build_vision_transform(image_size=DEFAULT_IMAGE_SIZE, augment=False):
+    target_size = _resolve_image_size(image_size)
+    transform_ops = [transforms.Resize(target_size)]
+
+    if augment:
+        transform_ops.extend([
+            transforms.ColorJitter(brightness=0.25, contrast=0.25, saturation=0.15, hue=0.03),
+            transforms.RandomApply([
+                transforms.RandomAffine(degrees=8, translate=(0.05, 0.05), scale=(0.95, 1.05))
+            ], p=0.6),
+        ])
+
+    transform_ops.extend([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+    if augment:
+        transform_ops.append(transforms.RandomErasing(p=0.15, scale=(0.01, 0.06), ratio=(0.3, 3.3)))
+
+    return transforms.Compose(transform_ops)
+
+
+def _window_starts(sequence_len, input_steps=10, output_steps=10, stride=1):
+    total_steps = input_steps + output_steps
+    if sequence_len < total_steps:
+        return []
+    return range(0, sequence_len - total_steps + 1, max(1, int(stride)))
+
+
+def _group_train_val_indices(group_ids, val_ratio=0.1, random_seed=42):
+    group_ids = np.asarray(group_ids)
+    unique_groups = np.unique(group_ids)
+
+    if len(unique_groups) <= 1:
+        return np.arange(len(group_ids)), np.array([], dtype=np.int64)
+
+    rng = np.random.default_rng(random_seed)
+    shuffled_groups = unique_groups.copy()
+    rng.shuffle(shuffled_groups)
+
+    val_group_count = max(1, int(round(len(unique_groups) * val_ratio)))
+    val_group_count = min(val_group_count, len(unique_groups) - 1)
+    val_groups = set(shuffled_groups[:val_group_count])
+
+    val_mask = np.array([g in val_groups for g in group_ids], dtype=bool)
+    val_indices = np.where(val_mask)[0]
+    train_indices = np.where(~val_mask)[0]
+
+    if len(train_indices) == 0 and len(val_indices) > 0:
+        train_indices = val_indices[:1]
+        val_indices = val_indices[1:]
+
+    return train_indices, val_indices
+
+
+def _random_train_val_indices(total_samples, val_ratio=0.1, random_seed=42):
+    if total_samples <= 1:
+        return np.arange(total_samples), np.array([], dtype=np.int64)
+
+    indices = np.arange(total_samples)
+    rng = np.random.default_rng(random_seed)
+    rng.shuffle(indices)
+
+    val_size = max(1, int(round(total_samples * val_ratio)))
+    val_size = min(val_size, total_samples - 1)
+
+    val_indices = indices[:val_size]
+    train_indices = indices[val_size:]
+    return train_indices, val_indices
+
+
+def _index_data(data, indices):
+    if isinstance(data, np.ndarray):
+        return data[indices]
+    return [data[i] for i in indices]
+
+
+def normalize_coordinate_df(df):
+    df['x-coordinate'] = df['x-coordinate'] / VIDEO_WIDTH
+    df['y-coordinate'] = df['y-coordinate'] / VIDEO_HEIGHT
+    return df
 
 # get trajectory data for the LSTM model: use frames 0-9 as input to predict frames 10-19
-def getTrajectoryTrainData():
+def getTrajectoryTrainData(window_stride=1, return_groups=False):
     input_data = []
     output_data = []
+    group_ids = []
     for game_folder in os.listdir(dataset):
         if game_folder.startswith("game"):
             for clip_folder in os.listdir(os.path.join(dataset, game_folder)):
@@ -23,15 +122,22 @@ def getTrajectoryTrainData():
                     # convert "None" strings to actual np.nan float values
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
 
                     # interpolate missing values so the LSTM has continuous input
                     df['x-coordinate'] = df['x-coordinate'].interpolate(method='linear').bfill().ffill()
                     df['y-coordinate'] = df['y-coordinate'].interpolate(method='linear').bfill().ffill()
-                    for i in range(0, len(df) - 20, 20):
+                    clip_id = f"{game_folder}/{clip_folder}"
+                    for i in _window_starts(len(df), input_steps=10, output_steps=10, stride=window_stride):
                         input_data.append(df.iloc[i:i+10][['x-coordinate', 'y-coordinate']].values)
                         output_data.append(df.iloc[i+10:i+20][['x-coordinate', 'y-coordinate']].values)
+                        group_ids.append(clip_id)
 
-    return np.array(input_data, dtype=np.float32), np.array(output_data, dtype=np.float32)
+    input_arr = np.array(input_data, dtype=np.float32)
+    output_arr = np.array(output_data, dtype=np.float32)
+    if return_groups:
+        return input_arr, output_arr, np.array(group_ids)
+    return input_arr, output_arr
 
 
 def getTrajectoryTestData():
@@ -44,6 +150,7 @@ def getTrajectoryTestData():
                     df = pd.read_csv(filename)
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
                     
                     input_data = []
                     output_data = []
@@ -69,9 +176,10 @@ def getTrajectoryTestData():
     return test_data_dict
 
 
-def getVisionTrainData():
+def getVisionTrainData(window_stride=1, return_groups=False):
     input_paths = []
     output_data = []
+    group_ids = []
     for game_folder in os.listdir(dataset):
         if game_folder.startswith("game"):
             for clip_folder in os.listdir(os.path.join(dataset, game_folder)):
@@ -84,10 +192,12 @@ def getVisionTrainData():
                     
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
                     df['x-coordinate'] = df['x-coordinate'].interpolate(method='linear').bfill().ffill()
                     df['y-coordinate'] = df['y-coordinate'].interpolate(method='linear').bfill().ffill()
 
-                    for i in range(0, len(img_files) - 20, 20):
+                    clip_id = f"{game_folder}/{clip_folder}"
+                    for i in _window_starts(len(img_files), input_steps=10, output_steps=10, stride=window_stride):
                         input_imgs = []
                         for j in range(i, i+10):
                             # Store the PATH, not the image itself
@@ -96,9 +206,13 @@ def getVisionTrainData():
                             
                         input_paths.append(input_imgs)
                         output_data.append(df.iloc[i+10:i+20][['x-coordinate', 'y-coordinate']].values)
+                        group_ids.append(clip_id)
 
     # Return lists of paths, and numpy arrays for targets
-    return input_paths, np.array(output_data, dtype=np.float32)
+    output_arr = np.array(output_data, dtype=np.float32)
+    if return_groups:
+        return input_paths, output_arr, np.array(group_ids)
+    return input_paths, output_arr
 
 def getVisionTestData():
     test_data_dict = {}
@@ -113,6 +227,7 @@ def getVisionTestData():
                     df = pd.read_csv(label_file)
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
                     
                     input_paths = []
                     output_data = []
@@ -130,18 +245,12 @@ def getVisionTestData():
 
     return test_data_dict
 
-# --- NEW CUSTOM DATASET ---
+
 class VisionDataset(Dataset):
-    def __init__(self, image_paths, labels, transform=None):
+    def __init__(self, image_paths, labels, transform=None, image_size=DEFAULT_IMAGE_SIZE, augment=False):
         self.image_paths = image_paths
         self.labels = labels
-        # Resize images to 224x224 to save memory and speed up training
-        self.transform = transform or transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            # Standard normalization for CNNs
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.transform = transform or build_vision_transform(image_size=image_size, augment=augment)
 
     def __len__(self):
         return len(self.image_paths)
@@ -165,10 +274,11 @@ class VisionDataset(Dataset):
         return frames_tensor, label_tensor
 
 
-def getFusionTrainData():
+def getFusionTrainData(window_stride=1, return_groups=False):
     input_paths = []
     input_coords = []
     output_data = []
+    group_ids = []
     
     for game_folder in os.listdir(dataset):
         if game_folder.startswith("game"):
@@ -181,10 +291,12 @@ def getFusionTrainData():
                     df = pd.read_csv(label_file)
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
                     df['x-coordinate'] = df['x-coordinate'].interpolate(method='linear').bfill().ffill()
                     df['y-coordinate'] = df['y-coordinate'].interpolate(method='linear').bfill().ffill()
 
-                    for i in range(0, len(img_files) - 20, 20):
+                    clip_id = f"{game_folder}/{clip_folder}"
+                    for i in _window_starts(len(img_files), input_steps=10, output_steps=10, stride=window_stride):
                         # 1. Image Paths
                         input_imgs = []
                         for j in range(i, i+10):
@@ -193,8 +305,14 @@ def getFusionTrainData():
                         input_paths.append(input_imgs)
                         input_coords.append(df.iloc[i:i+10][['x-coordinate', 'y-coordinate']].values)  # Trajectory input
                         output_data.append(df.iloc[i+10:i+20][['x-coordinate', 'y-coordinate']].values)  # Trajectory output
+                        group_ids.append(clip_id)
 
-    return (input_paths, np.array(input_coords, dtype=np.float32)), np.array(output_data, dtype=np.float32)
+    input_tuple = (input_paths, np.array(input_coords, dtype=np.float32))
+    output_arr = np.array(output_data, dtype=np.float32)
+    if return_groups:
+        return input_tuple, output_arr, np.array(group_ids)
+    return input_tuple, output_arr
+
 
 def getFusionTestData():
     test_data_dict = {}
@@ -210,6 +328,7 @@ def getFusionTestData():
                     df = pd.read_csv(label_file)
                     df['x-coordinate'] = pd.to_numeric(df['x-coordinate'], errors='coerce')
                     df['y-coordinate'] = pd.to_numeric(df['y-coordinate'], errors='coerce')
+                    df = normalize_coordinate_df(df)
                     
                     input_paths = []
                     input_coords = []
@@ -239,14 +358,10 @@ def getFusionTestData():
 
 
 class FusionDataset(Dataset):
-    def __init__(self, input_data, target_coords, transform=None):
+    def __init__(self, input_data, target_coords, transform=None, image_size=DEFAULT_IMAGE_SIZE, augment=False):
         self.image_paths, self.input_coords = input_data
         self.target_coords = target_coords
-        self.transform = transform or transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        self.transform = transform or build_vision_transform(image_size=image_size, augment=augment)
 
     def __len__(self):
         return len(self.image_paths)
@@ -272,34 +387,42 @@ class FusionDataset(Dataset):
 
 
 # split data into training and validation sets for regular input (list/array)
-def splitTrainValRegular(input_data, output_data, val_ratio=0.1):
+def splitTrainValRegular(input_data, output_data, val_ratio=0.1, group_ids=None, random_seed=42):
     total_samples = len(input_data)
-    val_size = int(total_samples * val_ratio)
 
-    train_input = input_data[:-val_size]
-    train_output = output_data[:-val_size]
-    val_input = input_data[-val_size:]
-    val_output = output_data[-val_size:]
+    if group_ids is not None and len(group_ids) == total_samples:
+        train_indices, val_indices = _group_train_val_indices(group_ids, val_ratio, random_seed)
+    else:
+        train_indices, val_indices = _random_train_val_indices(total_samples, val_ratio, random_seed)
+
+    train_input = _index_data(input_data, train_indices)
+    train_output = _index_data(output_data, train_indices)
+    val_input = _index_data(input_data, val_indices)
+    val_output = _index_data(output_data, val_indices)
 
     return train_input, train_output, val_input, val_output
 
 
 # split data into training and validation sets for fusion input tuple
-def splitTrainValFusion(input_data, output_data, val_ratio=0.1):
+def splitTrainValFusion(input_data, output_data, val_ratio=0.1, group_ids=None, random_seed=42):
     image_paths, input_coords = input_data
     total_samples = len(image_paths)
 
-    val_size = int(total_samples * val_ratio)
-    train_input = (image_paths[:-val_size], input_coords[:-val_size])
-    val_input = (image_paths[-val_size:], input_coords[-val_size:])
-    train_output = output_data[:-val_size]
-    val_output = output_data[-val_size:]
+    if group_ids is not None and len(group_ids) == total_samples:
+        train_indices, val_indices = _group_train_val_indices(group_ids, val_ratio, random_seed)
+    else:
+        train_indices, val_indices = _random_train_val_indices(total_samples, val_ratio, random_seed)
+
+    train_input = (_index_data(image_paths, train_indices), _index_data(input_coords, train_indices))
+    val_input = (_index_data(image_paths, val_indices), _index_data(input_coords, val_indices))
+    train_output = _index_data(output_data, train_indices)
+    val_output = _index_data(output_data, val_indices)
 
     return train_input, train_output, val_input, val_output
 
 
 # Backward-compatible wrapper
-def splitTrainVal(input_data, output_data, val_ratio=0.1):
+def splitTrainVal(input_data, output_data, val_ratio=0.1, group_ids=None, random_seed=42):
     if isinstance(input_data, (tuple, list)) and len(input_data) == 2:
-        return splitTrainValFusion(input_data, output_data, val_ratio)
-    return splitTrainValRegular(input_data, output_data, val_ratio)
+        return splitTrainValFusion(input_data, output_data, val_ratio, group_ids=group_ids, random_seed=random_seed)
+    return splitTrainValRegular(input_data, output_data, val_ratio, group_ids=group_ids, random_seed=random_seed)

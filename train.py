@@ -1,18 +1,20 @@
-import torch
 import time
+import torch
 from utils import splitTrainVal
-from torch.utils.data import DataLoader, TensorDataset
-from torch.utils.tensorboard import SummaryWriter
 from utils import VisionDataset, FusionDataset
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader, TensorDataset
 
-def trainTrajectoryModel(model, input_data, output_data, device, num_epochs=300, batch_size=64, learning_rate=0.001):
+IMAGE_SIZE = (288, 512)
+
+def trainTrajectoryModel(model, input_data, output_data, device, num_epochs=100, batch_size=64, learning_rate=0.001, group_ids=None, model_name="trajectory_model.pth"):
     model.to(device)
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir=f"logs/{timestamp}")
 
-    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data)
+    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data, group_ids=group_ids)
 
     train_input = torch.tensor(train_input, dtype=torch.float32).to(device)
     train_output = torch.tensor(train_output, dtype=torch.float32).to(device)
@@ -53,26 +55,52 @@ def trainTrajectoryModel(model, input_data, output_data, device, num_epochs=300,
     
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "trajectory_model.pth")
+            torch.save(model.state_dict(), model_name)
 
 
 
-def trainVisionModel(model, input_data, output_data, device, num_epochs=100, batch_size=8, learning_rate=0.001):
+def trainVisionModel(
+    model,
+    input_data,
+    output_data,
+    device,
+    num_epochs=60,
+    batch_size=8,
+    learning_rate=0.001,
+    group_ids=None,
+    loss_type="smooth_l1",
+    weight_decay=1e-4,
+    grad_clip_norm=1.0,
+    early_stopping_patience=10,
+    model_name="vision_model.pth",
+):
     model.to(device)
-    criterion = torch.nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    if loss_type == "mse":
+        criterion = torch.nn.MSELoss()
+    else:
+        criterion = torch.nn.SmoothL1Loss(beta=0.02)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        min_lr=1e-6,
+    )
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir=f"logs/{timestamp}")
 
-    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data)
+    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data, group_ids=group_ids)
 
-    train_dataset = VisionDataset(train_input, train_output)
-    val_dataset = VisionDataset(val_input, val_output)
+    train_dataset = VisionDataset(train_input, train_output, image_size=IMAGE_SIZE, augment=True)
+    val_dataset = VisionDataset(val_input, val_output, image_size=IMAGE_SIZE, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
     best_val_loss = float('inf')
+    epochs_without_improve = 0
 
     for epoch in range(num_epochs):
         model.train()
@@ -84,6 +112,7 @@ def trainVisionModel(model, input_data, output_data, device, num_epochs=100, bat
             predictions = model(batch_input)
             loss = criterion(predictions, batch_output)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
             total_loss += loss.item()
 
@@ -99,27 +128,38 @@ def trainVisionModel(model, input_data, output_data, device, num_epochs=100, bat
                 val_loss += criterion(val_predictions, val_output_batch).item()
 
         avg_val_loss = val_loss / len(val_loader)
+        scheduler.step(avg_val_loss)
+        current_lr = optimizer.param_groups[0]['lr']
 
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, LR: {current_lr:.6f}, Loss: {avg_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         writer.add_scalar("Loss/train", avg_loss, epoch)
         writer.add_scalar("Loss/val", avg_val_loss, epoch)
+        writer.add_scalar("LR", current_lr, epoch)
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "vision_model.pth")
+            epochs_without_improve = 0
+            torch.save(model.state_dict(), model_name)
+        else:
+            epochs_without_improve += 1
+            if epochs_without_improve >= early_stopping_patience:
+                print(f"Early stopping at epoch {epoch+1}. Best val loss: {best_val_loss:.4f}")
+                break
+
+    writer.close()
 
 
-def trainFusionModel(model, input_data, output_data, device, num_epochs=30, batch_size=8, learning_rate=0.001):
+def trainFusionModel(model, input_data, output_data, device, num_epochs=30, batch_size=8, learning_rate=0.001, group_ids=None, model_name="fusion_model.pth"):
     model.to(device)
     criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir=f"logs/{timestamp}")
 
-    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data)
+    train_input, train_output, val_input, val_output = splitTrainVal(input_data, output_data, group_ids=group_ids)
     
-    train_dataset = FusionDataset(train_input, train_output)
-    val_dataset = FusionDataset(val_input, val_output)
+    train_dataset = FusionDataset(train_input, train_output, image_size=IMAGE_SIZE, augment=True)
+    val_dataset = FusionDataset(val_input, val_output, image_size=IMAGE_SIZE, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
@@ -162,4 +202,4 @@ def trainFusionModel(model, input_data, output_data, device, num_epochs=30, batc
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "fusion_model.pth")
+            torch.save(model.state_dict(), model_name)
